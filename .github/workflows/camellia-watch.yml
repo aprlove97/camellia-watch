@@ -37,7 +37,7 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          TARGET_DATE: '2026-10-02'
+          TARGET_DATE: '2026-08-20'
           TARGET_TAB: '2등실'
           PASSENGERS: '2'
           DEPART_FROM_BUSAN: '1'
