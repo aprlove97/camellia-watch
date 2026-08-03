@@ -1,241 +1,240 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-뉴카멜리아 예약 화면 정찰 스크립트  [v3 — 조사 전용]
+뉴카멜리아(고려훼리) 좌석 확인  [v4]
 
-이 버전은 좌석을 확인하지 않는다. 검색 버튼도 누르지 않는다.
-예약 화면에 무엇이 있는지 기록만 하고 끝낸다.
+v3 정찰로 알아낸 실제 폼 구조를 그대로 쓴다.
 
-v1 이 실패한 이유
-    페이지 우측 상단의 '사이트 내 검색창'에 날짜를 넣고 그 옆 검색 버튼을 눌렀다.
-    그래서 게시판 검색 결과 페이지로 이동해버렸고, 예약 엔진은 건드리지도 못했다.
+    form#entry-form  →  POST /rs/idv/reservation/index_post
+      oufuku   radio    1=편도, 2=왕복
+      ow       select   2=ＢＵＳＡＮ→ＨＡＫＡＴＡ, 1=ＨＡＫＡＴＡ→ＢＵＳＡＮ
+      rt       select   ow 를 바꾸면 자동으로 반대편이 채워진다 (비어 있으면 검증 실패)
+      ow_date  text     readonly 달력. 값을 직접 넣어야 한다. YYYY-MM-DD
+      number   text     인원 1~11
 
-남기는 것 (debug/ 폴더)
-    01_page.png              화면 스크린샷
-    01_page.html             화면 HTML 원본
-    02_inventory.txt         드롭다운/입력칸/버튼/프레임 목록  ← 제일 중요
-    03_network.txt           브라우저가 주고받은 통신 기록
-    04_body_text.txt         화면에 보이는 글자 전체
-
-항상 종료 코드 0 으로 끝난다 (초록불). 실패가 아니라 조사다.
+종료 코드
+    0  아직 매진
+    1  자리 있음 → 텔레그램 발송 + 일부러 실패 처리해서 깃허브 알림도 울림
+    2  조회 실패 → debug 아티팩트 확인
 """
 
-import json
 import os
+import re
 import sys
-import unicodedata
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 KST = timezone(timedelta(hours=9))
 URL = "https://www.koreaferry.co.kr/rs/idv/reservation"
 
+TARGET_DATE = os.environ.get("TARGET_DATE", "2026-10-02")
+PASSENGERS = os.environ.get("PASSENGERS", "2")
+TARGET_TAB = os.environ.get("TARGET_TAB", "1등 양실 (2명)")
+OW_VALUE = "2" if os.environ.get("DEPART_FROM_BUSAN", "1") == "1" else "1"
+
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+
+ALL_TABS = ["2등실", "1등 양실 (4명)", "1등 양실 (2명)", "1등 화실", "기타"]
+SOLD_OUT = ("매진", "SOLD OUT", "満席")
+
 DEBUG = Path("debug")
 DEBUG.mkdir(exist_ok=True)
-
-# 페이지 상단 '사이트 내 검색' 관련 요소들. 절대 건드리면 안 되는 것들.
-BLACKLIST_NAMES = {"stx", "sfl", "sop", "srows", "gr_id"}
-BLACKLIST_IDS = {"sch_stx", "sch_submit", "stx", "sfl", "gr_id"}
-
-netlog = []
 
 
 def log(m: str) -> None:
     print(f"[{datetime.now(KST):%H:%M:%S}] {m}", flush=True)
 
 
-def norm(s: str) -> str:
-    return unicodedata.normalize("NFKC", s or "").strip()
+def summary(t: str) -> None:
+    p = os.environ.get("GITHUB_STEP_SUMMARY")
+    if p:
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(t + "\n")
 
 
-def hook_network(page) -> None:
-    def on_request(req):
-        try:
-            if req.resource_type in ("xhr", "fetch", "document"):
-                entry = f"REQ  {req.method:5s} [{req.resource_type}] {req.url}"
-                pd = req.post_data
-                if pd:
-                    entry += f"\n     POST DATA: {pd[:800]}"
-                netlog.append(entry)
-        except Exception:  # noqa: BLE001
-            pass
-
-    def on_response(res):
-        try:
-            rt = res.request.resource_type
-            if rt not in ("xhr", "fetch", "document"):
-                return
-            ct = (res.headers or {}).get("content-type", "")
-            entry = f"RES  {res.status} [{rt}] {ct[:40]} {res.url}"
-            if "json" in ct or "text" in ct:
-                try:
-                    body = res.text()
-                    entry += f"\n     BODY(1500): {body[:1500]}"
-                except Exception:  # noqa: BLE001
-                    entry += "\n     BODY: (읽기 불가)"
-            netlog.append(entry)
-        except Exception:  # noqa: BLE001
-            pass
-
-    page.on("request", on_request)
-    page.on("response", on_response)
+def telegram(text: str) -> None:
+    if not (TG_BOT_TOKEN and TG_CHAT_ID):
+        log("텔레그램 시크릿 없음 — 발송 생략")
+        return
+    try:
+        import requests
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": text},
+            timeout=20,
+        )
+        log(f"텔레그램 발송: {r.status_code}")
+    except Exception as e:  # noqa: BLE001
+        log(f"텔레그램 실패: {e}")
 
 
-def wait_until_loaded(page, limit: int = 40) -> None:
-    """'Now Loading' 이 사라지고 실제 내용이 나올 때까지 기다린다."""
-    for i in range(limit):
-        try:
-            body = page.inner_text("body")
-        except Exception:  # noqa: BLE001
-            body = ""
-        if body and "Now Loading" not in body and len(body.strip()) > 300:
-            log(f"화면 로딩 완료 ({i + 1}초, 글자 {len(body)}자)")
-            return
-        page.wait_for_timeout(1_000)
-    log(f"[warn] {limit}초 대기했지만 로딩이 안 끝난 것으로 보임")
+def save(page, tag: str) -> None:
+    try:
+        page.screenshot(path=str(DEBUG / f"{tag}.png"), full_page=True)
+        (DEBUG / f"{tag}.html").write_text(page.content(), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
 
 
-def collect(page) -> str:
-    out = [f"URL: {page.url}", f"TITLE: {page.title()}", ""]
+# ─────────────────────────────────────────────────────────────
+# STEP1 — 조건 입력 후 검색
+# ─────────────────────────────────────────────────────────────
+def submit_search(page) -> None:
+    page.goto(URL, wait_until="domcontentloaded", timeout=60_000)
+    page.wait_for_selector("#entry-form", timeout=30_000)
+    page.wait_for_timeout(1_500)
+    log(f"STEP1 도착 — {page.url}")
 
-    out.append("### FRAMES (예약 엔진이 iframe 안에 있는지) ###")
-    for f in page.frames:
-        out.append(f"  name={f.name!r} url={f.url}")
+    # 편도
+    page.locator('#entry-form input[name="oufuku"][value="1"]').click()
 
-    for fi, frame in enumerate(page.frames):
-        tag = "MAIN" if frame is page.main_frame else f"FRAME[{fi}]"
-        out.append(f"\n{'=' * 55}\n{tag}  {frame.url}\n{'=' * 55}")
+    # 출발편 (드롭다운). 이걸 바꾸면 리턴편(rt)이 자동으로 반대편으로 채워진다.
+    page.select_option('#entry-form select[name="ow"]', OW_VALUE)
+    page.wait_for_timeout(500)
 
-        out.append("\n### FORMS ###")
-        try:
-            forms = frame.evaluate("""() => Array.from(document.forms).map(f => ({
-                name: f.name, id: f.id, action: f.action, method: f.method,
-                inputs: Array.from(f.elements).slice(0,40).map(e => e.tagName + ':' + (e.type||'') + ':' + (e.name||e.id||''))
-            }))""")
-            for i, f in enumerate(forms):
-                out.append(f"  [{i}] name={f['name']!r} id={f['id']!r} action={f['action']}")
-                out.append(f"       elements: {f['inputs']}")
-        except Exception as e:  # noqa: BLE001
-            out.append(f"  (실패: {e})")
+    rt_val = page.input_value('#entry-form select[name="rt"]')
+    if not rt_val:
+        page.select_option('#entry-form select[name="rt"]', "1" if OW_VALUE == "2" else "2")
+        log("리턴편 수동 지정")
 
-        out.append("\n### SELECT (드롭다운) ###")
-        try:
-            sels = frame.evaluate("""() => Array.from(document.querySelectorAll('select')).map(s => ({
-                id: s.id, name: s.name, cls: s.className,
-                visible: !!(s.offsetParent || s.getClientRects().length),
-                form: s.form ? (s.form.name || s.form.id || s.form.action) : null,
-                options: Array.from(s.options).slice(0,30).map(o => o.value + ' || ' + o.textContent.trim())
-            }))""")
-            for i, s in enumerate(sels):
-                mark = " <<< 헤더검색(무시)" if s["id"] in BLACKLIST_IDS or s["name"] in BLACKLIST_NAMES else ""
-                out.append(f"  [{i}] id={s['id']!r} name={s['name']!r} visible={s['visible']} form={s['form']!r}{mark}")
-                for o in s["options"]:
-                    out.append(f"        {o}")
-        except Exception as e:  # noqa: BLE001
-            out.append(f"  (실패: {e})")
+    # 출발일 — readonly 달력이라 값을 직접 밀어넣는다
+    page.evaluate(
+        """(v) => {
+            const el = document.querySelector('#entry-form input[name="ow_date"]');
+            el.removeAttribute('readonly');
+            el.value = v;
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+        }""",
+        TARGET_DATE,
+    )
 
-        out.append("\n### INPUT (입력칸/버튼) ###")
-        try:
-            ins = frame.evaluate("""() => Array.from(document.querySelectorAll('input')).map(i => ({
-                type: i.type, id: i.id, name: i.name, cls: i.className,
-                value: (i.value||'').slice(0,40), placeholder: i.placeholder,
-                readonly: i.readOnly,
-                visible: !!(i.offsetParent || i.getClientRects().length),
-                form: i.form ? (i.form.name || i.form.id || i.form.action) : null,
-                onclick: (i.getAttribute('onclick')||'').slice(0,150)
-            }))""")
-            for i, e in enumerate(ins):
-                mark = " <<< 헤더검색(무시)" if e["id"] in BLACKLIST_IDS or e["name"] in BLACKLIST_NAMES else ""
-                out.append(f"  [{i}] {json.dumps(e, ensure_ascii=False)}{mark}")
-        except Exception as e:  # noqa: BLE001
-            out.append(f"  (실패: {e})")
+    # 인원
+    page.evaluate(
+        """(v) => {
+            const el = document.querySelector('#entry-form input[name="number"]');
+            el.value = v;
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+        }""",
+        PASSENGERS,
+    )
 
-        out.append("\n### 클릭 가능한 요소 (조회/검색/확인 등) ###")
-        try:
-            btns = frame.evaluate("""() => {
-                const kw = ['검색','조회','확인','다음','선택','예약'];
-                return Array.from(document.querySelectorAll('button, a, input[type=submit], input[type=button], div[onclick], span[onclick], li[onclick]'))
-                  .map(e => ({tag:e.tagName, id:e.id, cls:(e.className||'').toString().slice(0,60),
-                              text:(e.textContent||'').trim().slice(0,40), value:e.value||'',
-                              onclick:(e.getAttribute('onclick')||'').slice(0,150),
-                              href:(e.getAttribute('href')||'').slice(0,120),
-                              visible: !!(e.offsetParent || e.getClientRects().length)}))
-                  .filter(o => kw.some(k => (o.text+o.value).includes(k)));
-            }""")
-            for i, b in enumerate(btns):
-                mark = " <<< 헤더검색(무시)" if b["id"] in BLACKLIST_IDS else ""
-                out.append(f"  [{i}] {json.dumps(b, ensure_ascii=False)}{mark}")
-        except Exception as e:  # noqa: BLE001
-            out.append(f"  (실패: {e})")
+    state = page.evaluate("""() => {
+        const f = document.getElementById('entry-form');
+        const g = n => { const e = f.querySelector('[name="' + n + '"]'); return e ? e.value : null; };
+        return {oufuku: (f.querySelector('[name=oufuku]:checked')||{}).value,
+                ow: g('ow'), rt: g('rt'), ow_date: g('ow_date'), number: g('number')};
+    }""")
+    log(f"입력값 확인 — {state}")
+    save(page, "10_step1_filled")
 
-        out.append("\n### 날짜처럼 보이는 요소 ###")
-        try:
-            dates = frame.evaluate("""() => Array.from(document.querySelectorAll('*'))
-                .filter(e => e.children.length === 0)
-                .map(e => (e.textContent||'').trim())
-                .filter(t => /^\\d{1,2}\\s*\\/\\s*\\d{1,2}/.test(t) || /\\d{4}-\\d{2}-\\d{2}/.test(t))
-                .slice(0, 40)""")
-            out.append(f"  {dates}")
-        except Exception as e:  # noqa: BLE001
-            out.append(f"  (실패: {e})")
+    page.locator('#entry-form button[type="submit"]').click()
+    page.wait_for_load_state("domcontentloaded", timeout=45_000)
+    page.wait_for_timeout(3_000)
+    log(f"검색 실행 — 도착 {page.url}")
 
-    return "\n".join(out)
+    err = page.evaluate(
+        "() => { const e = document.querySelector('#error'); "
+        "return (e && e.offsetParent) ? e.innerText.trim() : ''; }"
+    )
+    if err:
+        log(f"[warn] 폼 오류 메시지: {err}")
+
+    save(page, "20_step2")
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP2 — 등급 탭 읽기
+# ─────────────────────────────────────────────────────────────
+def click_tab(page, label: str) -> bool:
+    """공백 차이를 무시하고 탭을 찾아 누른다. ('1 등 양실' vs '1등 양실')"""
+    key = re.sub(r"\s+", "", label)
+    return bool(page.evaluate(
+        """(key) => {
+            const norm = s => (s || '').replace(/\\s+/g, '');
+            const els = Array.from(document.querySelectorAll('a,button,li,span,div,td,th,p'));
+            const hits = els.filter(e => norm(e.textContent) === key);
+            if (!hits.length) return false;
+            hits.sort((a, b) => a.getElementsByTagName('*').length - b.getElementsByTagName('*').length);
+            hits[0].click();
+            return true;
+        }""",
+        key,
+    ))
+
+
+def read_fare_table(page) -> str:
+    return page.evaluate("""() => {
+        const ts = Array.from(document.querySelectorAll('table'));
+        const hit = ts.filter(t => /운임|요금구분|클래스/.test(t.innerText));
+        return (hit.length ? hit : ts).map(t => t.innerText).join('\\n---\\n');
+    }""")
 
 
 def main() -> int:
     from playwright.sync_api import sync_playwright
 
-    log("정찰 시작 — 좌석 확인은 하지 않는다")
+    stamp = f"{TARGET_DATE} / {TARGET_TAB} / {PASSENGERS}인"
+    log(f"확인 시작 — {stamp}")
+    target_text = ""
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
         ctx = browser.new_context(locale="ko-KR", viewport={"width": 1600, "height": 1400})
         page = ctx.new_page()
-        page.set_default_timeout(10_000)
-        hook_network(page)
-
+        page.set_default_timeout(15_000)
         try:
-            page.goto(URL, wait_until="domcontentloaded", timeout=60_000)
-            wait_until_loaded(page)
-            page.wait_for_timeout(3_000)
-
-            page.screenshot(path=str(DEBUG / "01_page.png"), full_page=True)
-            (DEBUG / "01_page.html").write_text(page.content(), encoding="utf-8")
-
-            inv = collect(page)
-            (DEBUG / "02_inventory.txt").write_text(inv, encoding="utf-8")
+            submit_search(page)
 
             body = page.inner_text("body")
-            (DEBUG / "04_body_text.txt").write_text(body, encoding="utf-8")
+            (DEBUG / "21_step2_text.txt").write_text(body, encoding="utf-8")
+            if "STEP.2" not in body and "요금" not in body:
+                log("[error] STEP2 로 넘어가지 못한 것 같다")
+                summary("⚠️ STEP2 진입 실패 — debug 확인")
+                return 2
 
-            # 로그에도 찍어둔다 — 파일 안 받아도 눈으로 볼 수 있게
-            log("=" * 50)
-            log("화면에 보이는 글자 (앞부분)")
-            log("=" * 50)
-            print(body[:1500], flush=True)
-            log("=" * 50)
-            log("화면 구조 (앞부분)")
-            log("=" * 50)
-            print(inv[:4000], flush=True)
+            for name in ALL_TABS:
+                if click_tab(page, name):
+                    page.wait_for_timeout(1_500)
+                    t = read_fare_table(page)
+                else:
+                    t = "(탭을 못 찾음)"
+                (DEBUG / f"30_tab_{re.sub(r'[^0-9가-힣]', '', name)}.txt").write_text(t, encoding="utf-8")
+                flag = "매진" if any(w in t for w in SOLD_OUT) else "여유?"
+                log(f"[{name}] {flag} — {t[:150].replace(chr(10), ' | ')}")
+                if re.sub(r"\s+", "", name) == re.sub(r"\s+", "", TARGET_TAB):
+                    target_text = t
+
+            save(page, "40_final")
 
         except Exception as e:  # noqa: BLE001
             log(f"[error] {type(e).__name__}: {e}")
-            try:
-                page.screenshot(path=str(DEBUG / "01_page.png"), full_page=True)
-                (DEBUG / "01_page.html").write_text(page.content(), encoding="utf-8")
-            except Exception:  # noqa: BLE001
-                pass
+            save(page, "90_error")
+            summary(f"⚠️ 조회 실패 ({type(e).__name__}) — debug 확인")
+            return 2
         finally:
-            (DEBUG / "03_network.txt").write_text("\n".join(netlog), encoding="utf-8")
-            log(f"통신 기록 {len(netlog)}건 저장")
             ctx.close()
             browser.close()
 
-    s = os.environ.get("GITHUB_STEP_SUMMARY")
-    if s:
-        with open(s, "a", encoding="utf-8") as f:
-            f.write("🔍 정찰 완료 — 아티팩트의 02_inventory.txt 확인\n")
-    return 0
+    if not target_text.strip() or target_text.startswith("(탭"):
+        summary(f"⚠️ '{TARGET_TAB}' 탭을 못 읽음 — debug 확인")
+        return 2
+
+    if any(w in target_text for w in SOLD_OUT):
+        log("아직 매진")
+        summary(f"😴 아직 매진 — {stamp}")
+        return 0
+
+    if "KRW" not in target_text and "운임" not in target_text:
+        summary("⚠️ 매진도 요금도 안 보임 — 구조 확인 필요")
+        return 2
+
+    msg = (f"🚨 뉴카멜리아 자리 떴습니다\n{TARGET_DATE} 부산 출발 / {TARGET_TAB} / "
+           f"{PASSENGERS}인\n\n{target_text.strip()[:600]}\n\n{URL}")
+    log("자리 있음 — 알림 발송")
+    telegram(msg)
+    summary(f"🚨 **자리 있음** — {stamp}")
+    return 1
 
 
 if __name__ == "__main__":
