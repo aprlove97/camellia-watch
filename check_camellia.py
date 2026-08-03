@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-뉴카멜리아(고려훼리) 좌석 확인  [v4]
+뉴카멜리아(고려훼리) 좌석 감시  [v5]
 
-v3 정찰로 알아낸 실제 폼 구조를 그대로 쓴다.
+10/2 의 모든 등급 탭을 훑어서, 2인 전용 객실에 자리가 나면 알린다.
 
-    form#entry-form  →  POST /rs/idv/reservation/index_post
-      oufuku   radio    1=편도, 2=왕복
-      ow       select   2=ＢＵＳＡＮ→ＨＡＫＡＴＡ, 1=ＨＡＫＡＴＡ→ＢＵＳＡＮ
-      rt       select   ow 를 바꾸면 자동으로 반대편이 채워진다 (비어 있으면 검증 실패)
-      ow_date  text     readonly 달력. 값을 직접 넣어야 한다. YYYY-MM-DD
-      number   text     인원 1~11
+v4 대비 바뀐 점
+  * 표 전체가 아니라 '줄 단위'로 판정한다.
+    - 2등실 탭처럼 한 탭에 일반실/침대실이 같이 있어도 각각 구분된다.
+    - '입력하신 인원으로는 예약 하실 수 없습니다' 가 붙은 줄은 자리 없음으로 본다.
+    - 표에 머리글만 있고 내용이 없는 탭을 '여유'로 잘못 읽지 않는다.
+  * 감시 대상이 등급 하나가 아니라 전 등급이다. 정원 2인 방만 골라 알린다.
+  * 알림에 등급명 / 정원 / 요금이 모두 들어간다.
 
 종료 코드
-    0  아직 매진
+    0  2인 전용 객실 자리 없음 (정상)
     1  자리 있음 → 텔레그램 발송 + 일부러 실패 처리해서 깃허브 알림도 울림
     2  조회 실패 → debug 아티팩트 확인
 """
@@ -29,14 +30,20 @@ URL = "https://www.koreaferry.co.kr/rs/idv/reservation"
 
 TARGET_DATE = os.environ.get("TARGET_DATE", "2026-10-02")
 PASSENGERS = os.environ.get("PASSENGERS", "2")
-TARGET_TAB = os.environ.get("TARGET_TAB", "1등 양실 (2명)")
 OW_VALUE = "2" if os.environ.get("DEPART_FROM_BUSAN", "1") == "1" else "1"
+
+# TEST_MODE=1 이면 정원과 무관하게 예약 가능한 줄이 하나라도 있으면 알린다.
+# 알림 배선이 살아있는지 시험할 때만 쓴다.
+TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
 
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
 ALL_TABS = ["2등실", "1등 양실 (4명)", "1등 양실 (2명)", "1등 화실", "기타"]
 SOLD_OUT = ("매진", "SOLD OUT", "満席")
+BLOCKED = ("입력하신 인원", "예약 하실 수 없", "예약하실 수 없")
+# 정원 표기가 없어도 2인 전용으로 취급할 등급 이름
+TWO_PERSON_KEYWORDS = ("특등", "특별", "스위트", "디럭스", "트윈")
 
 DEBUG = Path("debug")
 DEBUG.mkdir(exist_ok=True)
@@ -64,7 +71,7 @@ def telegram(text: str) -> None:
             json={"chat_id": TG_CHAT_ID, "text": text},
             timeout=20,
         )
-        log(f"텔레그램 발송: {r.status_code}")
+        log(f"텔레그램 발송: {r.status_code} {r.text[:120]}")
     except Exception as e:  # noqa: BLE001
         log(f"텔레그램 실패: {e}")
 
@@ -84,70 +91,49 @@ def submit_search(page) -> None:
     page.goto(URL, wait_until="domcontentloaded", timeout=60_000)
     page.wait_for_selector("#entry-form", timeout=30_000)
     page.wait_for_timeout(1_500)
-    log(f"STEP1 도착 — {page.url}")
 
-    # 편도
-    page.locator('#entry-form input[name="oufuku"][value="1"]').click()
-
-    # 출발편 (드롭다운). 이걸 바꾸면 리턴편(rt)이 자동으로 반대편으로 채워진다.
-    page.select_option('#entry-form select[name="ow"]', OW_VALUE)
+    page.locator('#entry-form input[name="oufuku"][value="1"]').click()      # 편도
+    page.select_option('#entry-form select[name="ow"]', OW_VALUE)            # 출발편
     page.wait_for_timeout(500)
 
-    rt_val = page.input_value('#entry-form select[name="rt"]')
-    if not rt_val:
+    if not page.input_value('#entry-form select[name="rt"]'):
         page.select_option('#entry-form select[name="rt"]', "1" if OW_VALUE == "2" else "2")
-        log("리턴편 수동 지정")
 
-    # 출발일 — readonly 달력이라 값을 직접 밀어넣는다
-    page.evaluate(
-        """(v) => {
-            const el = document.querySelector('#entry-form input[name="ow_date"]');
-            el.removeAttribute('readonly');
-            el.value = v;
-            el.dispatchEvent(new Event('change', {bubbles:true}));
-        }""",
+    page.evaluate(                                                          # 출발일 (readonly)
+        """(v) => { const e = document.querySelector('#entry-form input[name="ow_date"]');
+                    e.removeAttribute('readonly'); e.value = v;
+                    e.dispatchEvent(new Event('change', {bubbles:true})); }""",
         TARGET_DATE,
     )
-
-    # 인원
-    page.evaluate(
-        """(v) => {
-            const el = document.querySelector('#entry-form input[name="number"]');
-            el.value = v;
-            el.dispatchEvent(new Event('change', {bubbles:true}));
-        }""",
+    page.evaluate(                                                          # 인원
+        """(v) => { const e = document.querySelector('#entry-form input[name="number"]');
+                    e.value = v; e.dispatchEvent(new Event('change', {bubbles:true})); }""",
         PASSENGERS,
     )
-
-    state = page.evaluate("""() => {
-        const f = document.getElementById('entry-form');
-        const g = n => { const e = f.querySelector('[name="' + n + '"]'); return e ? e.value : null; };
-        return {oufuku: (f.querySelector('[name=oufuku]:checked')||{}).value,
-                ow: g('ow'), rt: g('rt'), ow_date: g('ow_date'), number: g('number')};
-    }""")
-    log(f"입력값 확인 — {state}")
-    save(page, "10_step1_filled")
 
     page.locator('#entry-form button[type="submit"]').click()
     page.wait_for_load_state("domcontentloaded", timeout=45_000)
     page.wait_for_timeout(3_000)
-    log(f"검색 실행 — 도착 {page.url}")
-
-    err = page.evaluate(
-        "() => { const e = document.querySelector('#error'); "
-        "return (e && e.offsetParent) ? e.innerText.trim() : ''; }"
-    )
-    if err:
-        log(f"[warn] 폼 오류 메시지: {err}")
-
-    save(page, "20_step2")
+    log(f"검색 완료 — {TARGET_DATE} / {PASSENGERS}인")
 
 
 # ─────────────────────────────────────────────────────────────
-# STEP2 — 등급 탭 읽기
+# STEP2 — 등급 탭을 돌며 줄 단위로 읽기
 # ─────────────────────────────────────────────────────────────
+ROWS_JS = """() => {
+    const out = [];
+    document.querySelectorAll('table').forEach(t => {
+        t.querySelectorAll('tr').forEach(tr => {
+            const cells = Array.from(tr.querySelectorAll('th,td'))
+                .map(c => (c.innerText || '').replace(/\\s+/g, ' ').trim());
+            if (cells.length) out.push(cells);
+        });
+    });
+    return out;
+}"""
+
+
 def click_tab(page, label: str) -> bool:
-    """공백 차이를 무시하고 탭을 찾아 누른다. ('1 등 양실' vs '1등 양실')"""
     key = re.sub(r"\s+", "", label)
     return bool(page.evaluate(
         """(key) => {
@@ -163,20 +149,46 @@ def click_tab(page, label: str) -> bool:
     ))
 
 
-def read_fare_table(page) -> str:
-    return page.evaluate("""() => {
-        const ts = Array.from(document.querySelectorAll('table'));
-        const hit = ts.filter(t => /운임|요금구분|클래스/.test(t.innerText));
-        return (hit.length ? hit : ts).map(t => t.innerText).join('\\n---\\n');
-    }""")
+def parse_row(cells, tab):
+    """요금 줄 하나를 해석한다. 요금 줄이 아니면 None."""
+    joined = " | ".join(cells)
+    if "KRW" not in joined or "요금구분" in joined:
+        return None
+
+    cap = None
+    m = re.search(r"정원\s*(\d+)", joined) or re.search(r"(\d+)\s*인실", joined)
+    if m:
+        cap = int(m.group(1))
+
+    fare_m = re.search(r"[\d,]+\s*KRW", joined)
+
+    return {
+        "tab": tab,
+        "name": cells[0] if cells else "?",
+        "cap": cap,
+        "fare": fare_m.group(0) if fare_m else "?",
+        "sold": any(w in joined for w in SOLD_OUT),
+        "blocked": any(w in joined for w in BLOCKED),
+        "raw": joined[:300],
+    }
+
+
+def is_two_person_target(r) -> bool:
+    if r["sold"] or r["blocked"]:
+        return False
+    if TEST_MODE:
+        return True
+    if r["cap"] == 2:
+        return True
+    return any(k in r["name"] for k in TWO_PERSON_KEYWORDS)
 
 
 def main() -> int:
     from playwright.sync_api import sync_playwright
 
-    stamp = f"{TARGET_DATE} / {TARGET_TAB} / {PASSENGERS}인"
-    log(f"확인 시작 — {stamp}")
-    target_text = ""
+    log(f"확인 시작 — {TARGET_DATE} / {PASSENGERS}인 / 2인 전용 객실 감시"
+        + (" [시험모드]" if TEST_MODE else ""))
+    rows = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -187,53 +199,71 @@ def main() -> int:
             submit_search(page)
 
             body = page.inner_text("body")
-            (DEBUG / "21_step2_text.txt").write_text(body, encoding="utf-8")
+            (DEBUG / "step2_text.txt").write_text(body, encoding="utf-8")
             if "STEP.2" not in body and "요금" not in body:
-                log("[error] STEP2 로 넘어가지 못한 것 같다")
+                save(page, "error_step2")
                 summary("⚠️ STEP2 진입 실패 — debug 확인")
                 return 2
 
-            for name in ALL_TABS:
-                if click_tab(page, name):
-                    page.wait_for_timeout(1_500)
-                    t = read_fare_table(page)
-                else:
-                    t = "(탭을 못 찾음)"
-                (DEBUG / f"30_tab_{re.sub(r'[^0-9가-힣]', '', name)}.txt").write_text(t, encoding="utf-8")
-                flag = "매진" if any(w in t for w in SOLD_OUT) else "여유?"
-                log(f"[{name}] {flag} — {t[:150].replace(chr(10), ' | ')}")
-                if re.sub(r"\s+", "", name) == re.sub(r"\s+", "", TARGET_TAB):
-                    target_text = t
+            for tab in ALL_TABS:
+                if not click_tab(page, tab):
+                    log(f"[{tab}] 탭 없음")
+                    continue
+                page.wait_for_timeout(1_500)
+                found = [parse_row(c, tab) for c in page.evaluate(ROWS_JS)]
+                found = [r for r in found if r]
+                if not found:
+                    log(f"[{tab}] 요금 줄 없음")
+                for r in found:
+                    if not any(x["tab"] == r["tab"] and x["name"] == r["name"] for x in rows):
+                        rows.append(r)
 
-            save(page, "40_final")
+            save(page, "final")
 
         except Exception as e:  # noqa: BLE001
             log(f"[error] {type(e).__name__}: {e}")
-            save(page, "90_error")
+            save(page, "error")
             summary(f"⚠️ 조회 실패 ({type(e).__name__}) — debug 확인")
             return 2
         finally:
             ctx.close()
             browser.close()
 
-    if not target_text.strip() or target_text.startswith("(탭"):
-        summary(f"⚠️ '{TARGET_TAB}' 탭을 못 읽음 — debug 확인")
+    if not rows:
+        summary("⚠️ 요금표를 하나도 못 읽음 — debug 확인")
         return 2
 
-    if any(w in target_text for w in SOLD_OUT):
-        log("아직 매진")
-        summary(f"😴 아직 매진 — {stamp}")
+    # 전체 현황을 로그와 요약에 남긴다
+    log("─" * 60)
+    lines = []
+    for r in rows:
+        cap = f"정원 {r['cap']}" if r["cap"] else "정원 ?"
+        if r["sold"]:
+            st = "매진"
+        elif r["blocked"]:
+            st = "인원 조건 불가"
+        else:
+            st = "예약 가능"
+        line = f"{r['name']} / {cap} / {r['fare']} → {st}   [{r['tab']}]"
+        lines.append(line)
+        log(line)
+    log("─" * 60)
+    (DEBUG / "rows.txt").write_text("\n".join(lines), encoding="utf-8")
+
+    hits = [r for r in rows if is_two_person_target(r)]
+
+    if not hits:
+        summary(f"😴 2인 전용 객실 자리 없음 — {TARGET_DATE}\n\n```\n" + "\n".join(lines) + "\n```")
         return 0
 
-    if "KRW" not in target_text and "운임" not in target_text:
-        summary("⚠️ 매진도 요금도 안 보임 — 구조 확인 필요")
-        return 2
-
-    msg = (f"🚨 뉴카멜리아 자리 떴습니다\n{TARGET_DATE} 부산 출발 / {TARGET_TAB} / "
-           f"{PASSENGERS}인\n\n{target_text.strip()[:600]}\n\n{URL}")
+    detail = "\n".join(
+        f"• {r['name']} / 정원 {r['cap'] or '?'} / {r['fare']}  [{r['tab']} 탭]" for r in hits
+    )
+    msg = (f"🚨 뉴카멜리아 {TARGET_DATE} 부산 출발 — 자리 떴습니다\n\n"
+           f"{detail}\n\n지금 바로 예약하세요\n{URL}")
     log("자리 있음 — 알림 발송")
     telegram(msg)
-    summary(f"🚨 **자리 있음** — {stamp}")
+    summary(f"🚨 **자리 있음** — {TARGET_DATE}\n\n{detail}")
     return 1
 
 
