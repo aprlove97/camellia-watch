@@ -3,7 +3,7 @@ name: camellia-watch
 on:
   schedule:
     - cron: '*/5 * * * *'    # 5분마다 감시
-    - cron: '2 15 * * *'     # 매일 00:02 KST — 생존 알림 (UTC 15:02)
+    - cron: '2 12 * * *'     # 매일 21:02 KST — 생존 알림 (UTC 12:02)
   workflow_dispatch:
 
 concurrency:
@@ -13,7 +13,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
@@ -28,6 +28,15 @@ jobs:
           pip install playwright requests
           playwright install --with-deps chromium
 
+      # 정확히 일정한 간격으로 접속하지 않도록 0~30초 무작위로 늦춘다.
+      # 저녁 9시 생존 알림과 수동 실행은 지연 없이 바로 돈다.
+      - name: 무작위 지연
+        if: github.event_name == 'schedule' && github.event.schedule != '2 12 * * *'
+        run: |
+          WAIT=$((RANDOM % 31))
+          echo "${WAIT}초 대기 후 조회"
+          sleep $WAIT
+
       - name: 좌석 확인
         id: check
         env:
@@ -40,8 +49,8 @@ jobs:
           DEPART_FROM_BUSAN: '1'         # 1 = 부산→하카타
           TEST_MODE: '0'                 # 평소 '0'. 알림 시험할 때만 '1'
 
-          # 00시 예약 실행일 때만 생존 알림을 켠다 (건드릴 필요 없음)
-          HEARTBEAT: ${{ github.event.schedule == '2 15 * * *' && '1' || '0' }}
+          # 저녁 9시 예약 실행일 때만 생존 알림을 켠다 (건드릴 필요 없음)
+          HEARTBEAT: ${{ github.event.schedule == '2 12 * * *' && '1' || '0' }}
         run: python check_camellia.py
 
       - name: 디버그 파일 업로드
