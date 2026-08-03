@@ -2,13 +2,8 @@ name: camellia-watch
 
 on:
   schedule:
-  #- cron: '*/5 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
-    inputs:
-      dump:
-        description: '모든 등급 탭 내용을 아티팩트로 저장'
-        type: boolean
-        default: true
 
 concurrency:
   group: camellia-watch
@@ -38,14 +33,13 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TARGET_DATE: '2026-08-20'
-          TARGET_TAB: '2등실'
           PASSENGERS: '2'
           DEPART_FROM_BUSAN: '1'
-          DUMP: ${{ (github.event_name == 'workflow_dispatch' && inputs.dump) && '1' || '0' }}
+          TEST_MODE: '1'
         run: python check_camellia.py
 
       - name: 디버그 파일 업로드
-        if: always()
+        if: always() && (github.event_name == 'workflow_dispatch' || steps.check.outcome == 'failure')
         uses: actions/upload-artifact@v4
         with:
           name: camellia-debug-${{ github.run_id }}
