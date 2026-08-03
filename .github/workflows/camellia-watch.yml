@@ -1,9 +1,8 @@
 name: camellia-watch
 
 on:
-  # 디버깅 동안 자동 실행 중지. 다 고치면 아래 두 줄 앞의 # 만 지우면 된다.
-  # schedule:
-  #   - cron: '*/5 * * * *'
+  schedule:
+  - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       dump:
