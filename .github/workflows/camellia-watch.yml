@@ -2,7 +2,7 @@ name: camellia-watch
 
 on:
   schedule:
-  - cron: '*/5 * * * *'
+  #- cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       dump:
