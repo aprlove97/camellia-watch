@@ -38,7 +38,7 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TARGET_DATE: '2026-10-02'
-          TARGET_TAB: '1 등 양실 (2 명)'
+          TARGET_TAB: '2등'
           PASSENGERS: '2'
           DEPART_FROM_BUSAN: '1'
           DUMP: ${{ (github.event_name == 'workflow_dispatch' && inputs.dump) && '1' || '0' }}
