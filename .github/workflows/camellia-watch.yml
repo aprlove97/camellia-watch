@@ -1,12 +1,10 @@
 name: camellia-watch
 
-# 이 파일은 저장소의 .github/workflows/camellia-watch.yml 위치에 두어야 한다.
-
 on:
-  schedule:
-    # 5분마다. 깃허브 부하에 따라 실제로는 5~15분 간격으로 도는 경우가 많다.
-    - cron: '*/5 * * * *'
-  workflow_dispatch:          # Actions 탭에서 수동 실행 (첫 테스트용)
+  # 디버깅 동안 자동 실행 중지. 다 고치면 아래 두 줄 앞의 # 만 지우면 된다.
+  # schedule:
+  #   - cron: '*/5 * * * *'
+  workflow_dispatch:
     inputs:
       dump:
         description: '모든 등급 탭 내용을 아티팩트로 저장'
@@ -40,7 +38,6 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          # ▼ 감시 조건은 여기만 고치면 된다
           TARGET_DATE: '2026-10-02'
           TARGET_TAB: '1 등 양실 (2 명)'
           PASSENGERS: '2'
@@ -48,9 +45,8 @@ jobs:
           DUMP: ${{ (github.event_name == 'workflow_dispatch' && inputs.dump) && '1' || '0' }}
         run: python check_camellia.py
 
-      # 수동 실행이거나 뭔가 걸렸을 때만 디버그 파일을 남긴다 (5분마다 쌓이면 곤란하므로)
       - name: 디버그 파일 업로드
-        if: always() && (github.event_name == 'workflow_dispatch' || steps.check.outcome == 'failure')
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: camellia-debug-${{ github.run_id }}
