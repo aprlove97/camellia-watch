@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-뉴카멜리아(고려훼리) 좌석 감시  [v6]
+뉴카멜리아(고려훼리) 좌석 감시  [v7]
 
-v5 대비 바뀐 점
-  * 이 사이트는 탭을 눌러도 모든 등급의 표를 화면 뒤에 전부 들고 있다.
-    그래서 탭마다 전체를 다시 읽어 같은 방이 탭 수만큼 중복됐다.
-    → 중복 제거를 탭 단위가 아니라 '방 단위'로 바꿨다.
-  * 탭 이름표는 신뢰할 수 없으므로 알림에서 뺐다. 대신 표의 '클래스' 칸을 쓴다.
-  * 객실명에서 영문 병기를 잘라 알림을 짧게 만들었다.
+v6 대비 바뀐 점
+  * 수신자를 여러 명 지원한다. TG_CHAT_ID 시크릿에 쉼표로 구분해 넣으면 된다.
+      예) 8882476844,1234567890
+  * 매일 00시 생존 알림. HEARTBEAT=1 로 실행되면 자리가 없어도
+    "감시 정상 작동 중" 메시지를 현재 좌석 현황과 함께 보낸다.
 
 종료 코드
     0  2인 전용 객실 자리 없음 (정상)
-    1  자리 있음 → 텔레그램 발송 + 일부러 실패 처리
+    1  자리 있음 → 알림 발송 + 일부러 실패 처리해서 깃허브 알림도 울림
     2  조회 실패 → debug 아티팩트 확인
 """
 
@@ -29,9 +28,10 @@ TARGET_DATE = os.environ.get("TARGET_DATE", "2026-10-02")
 PASSENGERS = os.environ.get("PASSENGERS", "2")
 OW_VALUE = "2" if os.environ.get("DEPART_FROM_BUSAN", "1") == "1" else "1"
 TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
+HEARTBEAT = os.environ.get("HEARTBEAT", "0") == "1"
 
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")   # 쉼표로 여러 명 가능
 
 ALL_TABS = ["2등실", "1등 양실 (4명)", "1등 양실 (2명)", "1등 화실", "기타"]
 SOLD_OUT = ("매진", "SOLD OUT", "満席")
@@ -54,19 +54,27 @@ def summary(t: str) -> None:
 
 
 def telegram(text: str) -> None:
-    if not (TG_BOT_TOKEN and TG_CHAT_ID):
+    """TG_CHAT_ID 에 쉼표로 적힌 모든 사람에게 보낸다."""
+    ids = [x.strip() for x in TG_CHAT_ID.split(",") if x.strip()]
+    if not (TG_BOT_TOKEN and ids):
         log("텔레그램 시크릿 없음 — 발송 생략")
         return
-    try:
-        import requests
-        r = requests.post(
-            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": text},
-            timeout=20,
-        )
-        log(f"텔레그램 발송: {r.status_code} {r.text[:120]}")
-    except Exception as e:  # noqa: BLE001
-        log(f"텔레그램 실패: {e}")
+    import requests
+    for cid in ids:
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                json={"chat_id": cid, "text": text},
+                timeout=20,
+            )
+            # 공개 저장소이므로 로그에는 뒤 4자리만 남긴다
+            mark = "…" + cid[-4:]
+            if r.status_code == 200:
+                log(f"텔레그램 발송 성공 [{mark}]")
+            else:
+                log(f"텔레그램 발송 실패 [{mark}] {r.status_code} {r.text[:150]}")
+        except Exception as e:  # noqa: BLE001
+            log(f"텔레그램 예외 [{cid[-4:]}]: {e}")
 
 
 def save(page, tag: str) -> None:
@@ -78,7 +86,6 @@ def save(page, tag: str) -> None:
 
 
 def shorten(name: str) -> str:
-    """'2등 일반실 (실속 할인Ⅰ) 2nd Class Cabin (...)' → '2등 일반실 (실속 할인Ⅰ)'"""
     m = re.search(r"[A-Za-z]", name)
     if not m:
         return name.strip()
@@ -150,8 +157,6 @@ def parse_row(cells):
         return None
 
     name = shorten(cells[0] if cells else "?")
-
-    # '클래스' 칸 — '1 등 양실 (2 명) 정원 2 이름' 같은 형태
     klass = ""
     for c in cells[1:]:
         if "등실" in c or "등 양실" in c or "등 화실" in c or "정원" in c:
@@ -188,8 +193,8 @@ def is_target(r) -> bool:
 def main() -> int:
     from playwright.sync_api import sync_playwright
 
-    log(f"확인 시작 — {TARGET_DATE} / {PASSENGERS}인"
-        + (" [시험모드: 예약 가능한 건 전부 알림]" if TEST_MODE else " / 2인 전용 객실만"))
+    mode = " [생존알림]" if HEARTBEAT else (" [시험모드]" if TEST_MODE else "")
+    log(f"확인 시작 — {TARGET_DATE} / {PASSENGERS}인{mode}")
     rows, seen = [], set()
 
     with sync_playwright() as p:
@@ -204,11 +209,11 @@ def main() -> int:
             (DEBUG / "step2_text.txt").write_text(body, encoding="utf-8")
             if "STEP.2" not in body and "요금" not in body:
                 save(page, "error_step2")
+                if HEARTBEAT:
+                    telegram(f"⚠️ 감시 오류 — 예약 화면에 들어가지 못했습니다\n{TARGET_DATE}\n{URL}")
                 summary("⚠️ STEP2 진입 실패 — debug 확인")
                 return 2
 
-            # 탭을 한 번씩 눌러 혹시 숨어 있는 표까지 불러온다.
-            # 중복은 '방' 기준으로 걸러내므로 같은 방이 여러 번 잡히지 않는다.
             for tab in ALL_TABS:
                 click_tab(page, tab)
                 page.wait_for_timeout(1_200)
@@ -227,6 +232,8 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             log(f"[error] {type(e).__name__}: {e}")
             save(page, "error")
+            if HEARTBEAT:
+                telegram(f"⚠️ 감시 오류 — {type(e).__name__}\n{TARGET_DATE}\n{URL}")
             summary(f"⚠️ 조회 실패 ({type(e).__name__}) — debug 확인")
             return 2
         finally:
@@ -234,6 +241,8 @@ def main() -> int:
             browser.close()
 
     if not rows:
+        if HEARTBEAT:
+            telegram(f"⚠️ 감시 오류 — 요금표를 읽지 못했습니다\n{TARGET_DATE}\n{URL}")
         summary("⚠️ 요금표를 하나도 못 읽음 — debug 확인")
         return 2
 
@@ -242,7 +251,7 @@ def main() -> int:
     for r in rows:
         st = "매진" if r["sold"] else ("인원 조건 불가" if r["blocked"] else "예약 가능")
         cap = f"정원 {r['cap']}" if r["cap"] else "다인실"
-        line = f"{r['name']} / {r['klass'] or '?'} / {cap} / {r['fare']} → {st}"
+        line = f"{r['name']} / {cap} / {r['fare']} → {st}"
         lines.append(line)
         log(line)
     log("─" * 60)
@@ -251,20 +260,27 @@ def main() -> int:
     hits = [r for r in rows if is_target(r)]
     table = "```\n" + "\n".join(lines) + "\n```"
 
-    if not hits:
-        summary(f"😴 2인 전용 객실 자리 없음 — {TARGET_DATE}\n\n{table}")
-        return 0
+    # 자리가 있으면 생존알림 여부와 무관하게 이쪽이 우선
+    if hits:
+        detail = "\n".join(f"• {r['name']} / {r['klass'] or '?'} / {r['fare']}" for r in hits)
+        telegram(f"🚨 뉴카멜리아 {TARGET_DATE} 부산 출발 — 자리 떴습니다\n\n{detail}\n\n"
+                 f"지금 바로 예약하세요\n{URL}")
+        log("자리 있음 — 알림 발송")
+        summary(f"🚨 **자리 있음** — {TARGET_DATE}\n\n{detail}\n\n{table}")
+        return 1
 
-    detail = "\n".join(
-        f"• {r['name']} / {r['klass'] or '?'} / {r['fare']}" for r in hits
-    )
-    head = "🚨 뉴카멜리아 {} 부산 출발 — {} 자리 떴습니다".format(
-        TARGET_DATE, "예약 가능한 방" if TEST_MODE else "2인 전용 객실"
-    )
-    telegram(f"{head}\n\n{detail}\n\n지금 바로 예약하세요\n{URL}")
-    log("자리 있음 — 알림 발송")
-    summary(f"🚨 **자리 있음** — {TARGET_DATE}\n\n{detail}\n\n{table}")
-    return 1
+    if HEARTBEAT:
+        now = f"{datetime.now(KST):%Y-%m-%d %H:%M}"
+        telegram(
+            f"✅ 감시 정상 작동 중 ({now} 기준)\n"
+            f"{TARGET_DATE} 부산 출발 / {PASSENGERS}인\n\n"
+            + "\n".join(lines)
+            + f"\n\n2인 전용 객실은 아직 자리가 없습니다.\n{URL}"
+        )
+        log("생존 알림 발송")
+
+    summary(f"😴 2인 전용 객실 자리 없음 — {TARGET_DATE}\n\n{table}")
+    return 0
 
 
 if __name__ == "__main__":
