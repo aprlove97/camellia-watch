@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-뉴카멜리아(고려훼리) 좌석 감시  [v5]
+뉴카멜리아(고려훼리) 좌석 감시  [v6]
 
-10/2 의 모든 등급 탭을 훑어서, 2인 전용 객실에 자리가 나면 알린다.
-
-v4 대비 바뀐 점
-  * 표 전체가 아니라 '줄 단위'로 판정한다.
-    - 2등실 탭처럼 한 탭에 일반실/침대실이 같이 있어도 각각 구분된다.
-    - '입력하신 인원으로는 예약 하실 수 없습니다' 가 붙은 줄은 자리 없음으로 본다.
-    - 표에 머리글만 있고 내용이 없는 탭을 '여유'로 잘못 읽지 않는다.
-  * 감시 대상이 등급 하나가 아니라 전 등급이다. 정원 2인 방만 골라 알린다.
-  * 알림에 등급명 / 정원 / 요금이 모두 들어간다.
+v5 대비 바뀐 점
+  * 이 사이트는 탭을 눌러도 모든 등급의 표를 화면 뒤에 전부 들고 있다.
+    그래서 탭마다 전체를 다시 읽어 같은 방이 탭 수만큼 중복됐다.
+    → 중복 제거를 탭 단위가 아니라 '방 단위'로 바꿨다.
+  * 탭 이름표는 신뢰할 수 없으므로 알림에서 뺐다. 대신 표의 '클래스' 칸을 쓴다.
+  * 객실명에서 영문 병기를 잘라 알림을 짧게 만들었다.
 
 종료 코드
     0  2인 전용 객실 자리 없음 (정상)
-    1  자리 있음 → 텔레그램 발송 + 일부러 실패 처리해서 깃허브 알림도 울림
+    1  자리 있음 → 텔레그램 발송 + 일부러 실패 처리
     2  조회 실패 → debug 아티팩트 확인
 """
 
@@ -31,9 +28,6 @@ URL = "https://www.koreaferry.co.kr/rs/idv/reservation"
 TARGET_DATE = os.environ.get("TARGET_DATE", "2026-10-02")
 PASSENGERS = os.environ.get("PASSENGERS", "2")
 OW_VALUE = "2" if os.environ.get("DEPART_FROM_BUSAN", "1") == "1" else "1"
-
-# TEST_MODE=1 이면 정원과 무관하게 예약 가능한 줄이 하나라도 있으면 알린다.
-# 알림 배선이 살아있는지 시험할 때만 쓴다.
 TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
 
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
@@ -42,7 +36,6 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 ALL_TABS = ["2등실", "1등 양실 (4명)", "1등 양실 (2명)", "1등 화실", "기타"]
 SOLD_OUT = ("매진", "SOLD OUT", "満席")
 BLOCKED = ("입력하신 인원", "예약 하실 수 없", "예약하실 수 없")
-# 정원 표기가 없어도 2인 전용으로 취급할 등급 이름
 TWO_PERSON_KEYWORDS = ("특등", "특별", "스위트", "디럭스", "트윈")
 
 DEBUG = Path("debug")
@@ -84,28 +77,33 @@ def save(page, tag: str) -> None:
         pass
 
 
-# ─────────────────────────────────────────────────────────────
-# STEP1 — 조건 입력 후 검색
+def shorten(name: str) -> str:
+    """'2등 일반실 (실속 할인Ⅰ) 2nd Class Cabin (...)' → '2등 일반실 (실속 할인Ⅰ)'"""
+    m = re.search(r"[A-Za-z]", name)
+    if not m:
+        return name.strip()
+    return name[: m.start()].rstrip(" 0123456789").strip()
+
+
 # ─────────────────────────────────────────────────────────────
 def submit_search(page) -> None:
     page.goto(URL, wait_until="domcontentloaded", timeout=60_000)
     page.wait_for_selector("#entry-form", timeout=30_000)
     page.wait_for_timeout(1_500)
 
-    page.locator('#entry-form input[name="oufuku"][value="1"]').click()      # 편도
-    page.select_option('#entry-form select[name="ow"]', OW_VALUE)            # 출발편
+    page.locator('#entry-form input[name="oufuku"][value="1"]').click()
+    page.select_option('#entry-form select[name="ow"]', OW_VALUE)
     page.wait_for_timeout(500)
-
     if not page.input_value('#entry-form select[name="rt"]'):
         page.select_option('#entry-form select[name="rt"]', "1" if OW_VALUE == "2" else "2")
 
-    page.evaluate(                                                          # 출발일 (readonly)
+    page.evaluate(
         """(v) => { const e = document.querySelector('#entry-form input[name="ow_date"]');
                     e.removeAttribute('readonly'); e.value = v;
                     e.dispatchEvent(new Event('change', {bubbles:true})); }""",
         TARGET_DATE,
     )
-    page.evaluate(                                                          # 인원
+    page.evaluate(
         """(v) => { const e = document.querySelector('#entry-form input[name="number"]');
                     e.value = v; e.dispatchEvent(new Event('change', {bubbles:true})); }""",
         PASSENGERS,
@@ -117,9 +115,6 @@ def submit_search(page) -> None:
     log(f"검색 완료 — {TARGET_DATE} / {PASSENGERS}인")
 
 
-# ─────────────────────────────────────────────────────────────
-# STEP2 — 등급 탭을 돌며 줄 단위로 읽기
-# ─────────────────────────────────────────────────────────────
 ROWS_JS = """() => {
     const out = [];
     document.querySelectorAll('table').forEach(t => {
@@ -149,11 +144,19 @@ def click_tab(page, label: str) -> bool:
     ))
 
 
-def parse_row(cells, tab):
-    """요금 줄 하나를 해석한다. 요금 줄이 아니면 None."""
+def parse_row(cells):
     joined = " | ".join(cells)
     if "KRW" not in joined or "요금구분" in joined:
         return None
+
+    name = shorten(cells[0] if cells else "?")
+
+    # '클래스' 칸 — '1 등 양실 (2 명) 정원 2 이름' 같은 형태
+    klass = ""
+    for c in cells[1:]:
+        if "등실" in c or "등 양실" in c or "등 화실" in c or "정원" in c:
+            klass = c
+            break
 
     cap = None
     m = re.search(r"정원\s*(\d+)", joined) or re.search(r"(\d+)\s*인실", joined)
@@ -163,17 +166,16 @@ def parse_row(cells, tab):
     fare_m = re.search(r"[\d,]+\s*KRW", joined)
 
     return {
-        "tab": tab,
-        "name": cells[0] if cells else "?",
+        "name": name,
+        "klass": re.sub(r"\s*이름\s*$", "", klass).strip(),
         "cap": cap,
         "fare": fare_m.group(0) if fare_m else "?",
         "sold": any(w in joined for w in SOLD_OUT),
         "blocked": any(w in joined for w in BLOCKED),
-        "raw": joined[:300],
     }
 
 
-def is_two_person_target(r) -> bool:
+def is_target(r) -> bool:
     if r["sold"] or r["blocked"]:
         return False
     if TEST_MODE:
@@ -186,9 +188,9 @@ def is_two_person_target(r) -> bool:
 def main() -> int:
     from playwright.sync_api import sync_playwright
 
-    log(f"확인 시작 — {TARGET_DATE} / {PASSENGERS}인 / 2인 전용 객실 감시"
-        + (" [시험모드]" if TEST_MODE else ""))
-    rows = []
+    log(f"확인 시작 — {TARGET_DATE} / {PASSENGERS}인"
+        + (" [시험모드: 예약 가능한 건 전부 알림]" if TEST_MODE else " / 2인 전용 객실만"))
+    rows, seen = [], set()
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -205,18 +207,20 @@ def main() -> int:
                 summary("⚠️ STEP2 진입 실패 — debug 확인")
                 return 2
 
+            # 탭을 한 번씩 눌러 혹시 숨어 있는 표까지 불러온다.
+            # 중복은 '방' 기준으로 걸러내므로 같은 방이 여러 번 잡히지 않는다.
             for tab in ALL_TABS:
-                if not click_tab(page, tab):
-                    log(f"[{tab}] 탭 없음")
-                    continue
-                page.wait_for_timeout(1_500)
-                found = [parse_row(c, tab) for c in page.evaluate(ROWS_JS)]
-                found = [r for r in found if r]
-                if not found:
-                    log(f"[{tab}] 요금 줄 없음")
-                for r in found:
-                    if not any(x["tab"] == r["tab"] and x["name"] == r["name"] for x in rows):
-                        rows.append(r)
+                click_tab(page, tab)
+                page.wait_for_timeout(1_200)
+                for cells in page.evaluate(ROWS_JS):
+                    r = parse_row(cells)
+                    if not r:
+                        continue
+                    key = (r["name"], r["klass"], r["fare"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows.append(r)
 
             save(page, "final")
 
@@ -233,37 +237,33 @@ def main() -> int:
         summary("⚠️ 요금표를 하나도 못 읽음 — debug 확인")
         return 2
 
-    # 전체 현황을 로그와 요약에 남긴다
     log("─" * 60)
     lines = []
     for r in rows:
-        cap = f"정원 {r['cap']}" if r["cap"] else "정원 ?"
-        if r["sold"]:
-            st = "매진"
-        elif r["blocked"]:
-            st = "인원 조건 불가"
-        else:
-            st = "예약 가능"
-        line = f"{r['name']} / {cap} / {r['fare']} → {st}   [{r['tab']}]"
+        st = "매진" if r["sold"] else ("인원 조건 불가" if r["blocked"] else "예약 가능")
+        cap = f"정원 {r['cap']}" if r["cap"] else "다인실"
+        line = f"{r['name']} / {r['klass'] or '?'} / {cap} / {r['fare']} → {st}"
         lines.append(line)
         log(line)
     log("─" * 60)
     (DEBUG / "rows.txt").write_text("\n".join(lines), encoding="utf-8")
 
-    hits = [r for r in rows if is_two_person_target(r)]
+    hits = [r for r in rows if is_target(r)]
+    table = "```\n" + "\n".join(lines) + "\n```"
 
     if not hits:
-        summary(f"😴 2인 전용 객실 자리 없음 — {TARGET_DATE}\n\n```\n" + "\n".join(lines) + "\n```")
+        summary(f"😴 2인 전용 객실 자리 없음 — {TARGET_DATE}\n\n{table}")
         return 0
 
     detail = "\n".join(
-        f"• {r['name']} / 정원 {r['cap'] or '?'} / {r['fare']}  [{r['tab']} 탭]" for r in hits
+        f"• {r['name']} / {r['klass'] or '?'} / {r['fare']}" for r in hits
     )
-    msg = (f"🚨 뉴카멜리아 {TARGET_DATE} 부산 출발 — 자리 떴습니다\n\n"
-           f"{detail}\n\n지금 바로 예약하세요\n{URL}")
+    head = "🚨 뉴카멜리아 {} 부산 출발 — {} 자리 떴습니다".format(
+        TARGET_DATE, "예약 가능한 방" if TEST_MODE else "2인 전용 객실"
+    )
+    telegram(f"{head}\n\n{detail}\n\n지금 바로 예약하세요\n{URL}")
     log("자리 있음 — 알림 발송")
-    telegram(msg)
-    summary(f"🚨 **자리 있음** — {TARGET_DATE}\n\n{detail}")
+    summary(f"🚨 **자리 있음** — {TARGET_DATE}\n\n{detail}\n\n{table}")
     return 1
 
 
