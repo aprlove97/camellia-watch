@@ -2,7 +2,8 @@ name: camellia-watch
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/5 * * * *'    # 5분마다 감시
+    - cron: '2 15 * * *'     # 매일 00:02 KST — 생존 알림 (UTC 15:02)
   workflow_dispatch:
 
 concurrency:
@@ -36,12 +37,13 @@ jobs:
           # ── 감시 조건. 여기만 고치면 된다 ──
           TARGET_DATE: '2026-10-02'      # 출발일
           PASSENGERS: '2'                # 인원
-          DEPART_FROM_BUSAN: '1'         # 1 = 부산→하카타, 0 = 하카타→부산
+          DEPART_FROM_BUSAN: '1'         # 1 = 부산→하카타
           TEST_MODE: '0'                 # 평소 '0'. 알림 시험할 때만 '1'
+
+          # 00시 예약 실행일 때만 생존 알림을 켠다 (건드릴 필요 없음)
+          HEARTBEAT: ${{ github.event.schedule == '2 15 * * *' && '1' || '0' }}
         run: python check_camellia.py
 
-      # 수동 실행이거나 뭔가 걸렸을 때만 저장한다.
-      # 5분마다 쌓으면 무료 저장 용량을 넘긴다.
       - name: 디버그 파일 업로드
         if: always() && (github.event_name == 'workflow_dispatch' || steps.check.outcome == 'failure')
         uses: actions/upload-artifact@v4
